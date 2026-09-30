@@ -1,0 +1,15 @@
+/build/
+/prev/
+/ref/
+/instructions.md
+/research.md
+/*.log
+/*.csv
+/*.bin
+/*.elf
+/*.map
+/.c-review-results/
+.env
+*.key
+*.pem
+*.p12

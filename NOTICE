@@ -1,0 +1,13 @@
+OpenDAC application firmware: GPL-3.0. See LICENSE.
+
+Original reference and experimental basis:
+  STM32F411_USB_AUDIO_DAC, https://github.com/har-in-air/STM32F411_USB_AUDIO_DAC
+  Local F401 USB Audio + DFU experiments, not redistributed here.
+
+ST dependency:
+  STM32CubeF4, https://github.com/STMicroelectronics/STM32CubeF4
+  Pinned release v1.28.3 as a Git submodule. The upstream licenses and
+  notices remain in that repository and its nested submodules.
+
+The STM32 development VID/PID in this firmware is not a grant of USB-IF
+identifier rights for a commercial product.
