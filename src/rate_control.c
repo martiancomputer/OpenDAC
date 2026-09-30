@@ -1,5 +1,6 @@
 #include "rate_control.h"
 #include "project.h"
+#include <stddef.h>
 
 typedef struct {
     uint32_t hz;
@@ -12,15 +13,47 @@ typedef struct {
 } measurement_t;
 
 static measurement_t current;
-static rate_override_t saved_48;
-static rate_override_t saved_96;
+typedef struct {
+    uint32_t hz;
+    rate_override_t override;
+} rate_calibration_t;
+
+static rate_calibration_t calibrations[] = {
+    {44100U, {0}}, {48000U, {0}}, {96000U, {0}}
+};
+
+static rate_calibration_t *profile(uint32_t hz)
+{
+    for (uint32_t i = 0; i < sizeof(calibrations) / sizeof(calibrations[0]); ++i)
+        if (calibrations[i].hz == hz) return &calibrations[i];
+    return NULL;
+}
 
 rate_override_t rate_override_for(uint32_t hz)
 {
-    if (hz == 48000U) return saved_48;
-    if (hz == 96000U) return saved_96;
-    return (rate_override_t){0};
+    rate_calibration_t *entry = profile(hz);
+    return entry != NULL ? entry->override : (rate_override_t){0};
 }
+
+bool rate_calibration_valid(uint32_t hz)
+{ return rate_override_for(hz).valid; }
+
+int32_t rate_error_ppm(void)
+{
+    if (current.measured_hz == 0U || current.hz == 0U) return 0;
+    return (int32_t)(((int64_t)current.measured_hz - current.hz) *
+                     1000000LL / current.hz);
+}
+
+static bool within_ppm(uint32_t limit)
+{
+    const int32_t error = rate_error_ppm();
+    return error >= -(int32_t)limit && error <= (int32_t)limit;
+}
+
+bool rate_gross_failure(void)
+{ return current.phase == RATE_FAILED &&
+         !within_ppm(CALIBRATION_FAILURE_THRESHOLD_PPM); }
 
 void rate_begin(uint32_t hz, uint16_t pll_n, uint16_t divisor)
 {
@@ -46,10 +79,8 @@ void rate_sof(uint32_t consumed_halfwords)
                    ((uint32_t)(current.sof_count - 1U) *
                     DMA_HALFWORDS_PER_FRAME));
     if (current.phase == RATE_VERIFYING) {
-        const uint32_t low = current.hz * 975U / 1000U;
-        const uint32_t high = current.hz * 1025U / 1000U;
-        current.phase = (current.measured_hz >= low &&
-                         current.measured_hz <= high) ? RATE_DONE : RATE_FAILED;
+        current.phase = within_ppm(CALIBRATION_SUCCESS_THRESHOLD_PPM) ?
+                        RATE_DONE : RATE_FAILED;
     } else {
         current.phase = RATE_ADJUST_PENDING;
     }
@@ -59,8 +90,7 @@ bool rate_take_adjustment(rate_override_t *out)
 {
     if (current.phase != RATE_ADJUST_PENDING) return false;
     current.phase = RATE_FAILED;
-    if (current.measured_hz >= current.hz * 975U / 1000U &&
-        current.measured_hz <= current.hz * 1025U / 1000U) {
+    if (within_ppm(CALIBRATION_REQUIRED_THRESHOLD_PPM)) {
         current.phase = RATE_DONE;
         return false;
     }
@@ -80,9 +110,9 @@ bool rate_take_adjustment(rate_override_t *out)
 
     *out = (rate_override_t){.pll_n = (uint16_t)n,
                              .divisor = (uint16_t)div, .valid = true};
-    if (current.hz == 48000U) saved_48 = *out;
-    else if (current.hz == 96000U) saved_96 = *out;
-    else return false;
+    rate_calibration_t *entry = profile(current.hz);
+    if (entry == NULL) return false;
+    entry->override = *out;
     return true;
 }
 
@@ -101,5 +131,8 @@ uint32_t rate_feedback_q14(uint32_t hz, uint32_t queued_halfwords)
     int32_t feedback_hz = (int32_t)hz + trim;
     if (feedback_hz < (int32_t)hz - 1000) feedback_hz = (int32_t)hz - 1000;
     if (feedback_hz > (int32_t)hz + 1000) feedback_hz = (int32_t)hz + 1000;
-    return (uint32_t)feedback_hz << 14;
+    // USB full-speed feedback is samples *per 1 ms USB frame* in 10.14
+    // format, not samples per second in 10.14. The wire packet is 3 bytes.
+    return (uint32_t)(((uint64_t)(uint32_t)feedback_hz * 16384U + 500U) /
+                      1000U);
 }

@@ -69,6 +69,12 @@ test: $(TARGET).elf
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Iinclude \
 		tests/test_rate.c src/rate_control.c -o build/test_rate
 	build/test_rate
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Iinclude \
+		tests/test_pcm24.c src/pcm24.c -o build/test_pcm24
+	build/test_pcm24
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Iinclude \
+		tests/test_ring.c -o build/test_ring
+	build/test_ring
 
 HOST_CC := cc
 

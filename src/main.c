@@ -62,6 +62,7 @@ int main(void)
     for (;;) {
         stream_service();
         if (dfu_pending()) {
+            stream_quiesce();
             HAL_Delay(50U); // let DFU_DETACH status ZLP finish
             if (USBD_DeInit(&usb_device) != USBD_OK) fatal_error();
             HAL_Delay(100U); // let the host observe D+ disconnect

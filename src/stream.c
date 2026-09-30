@@ -3,10 +3,14 @@
 #include "project.h"
 #include "diag.h"
 #include "stm32f4xx_hal.h"
+#include "hardware.h"
+#include "pcm24.h"
+#include "ring_math.h"
 #include <string.h>
 
-typedef enum { STREAM_STOPPED, STREAM_PREFILL, STREAM_RUNNING,
-               STREAM_FAULT } stream_state_t;
+typedef enum { STREAM_STOPPED, STREAM_PREFILL, STREAM_MEASURING,
+               STREAM_SETTLING, STREAM_RUNNING, STREAM_FAULT,
+               STREAM_CLOCK_FAILED } stream_state_t;
 
 static uint16_t samples[DMA_RING_HALFWORDS];
 static volatile uint32_t produced;
@@ -15,12 +19,19 @@ static volatile uint32_t last_dma_position;
 static volatile uint32_t queued;
 static volatile uint32_t feedback_q14;
 static volatile uint32_t selected_rate = 96000U;
+static volatile uint32_t requested_rate = 96000U;
 static volatile uint32_t pending_rate;
 static volatile bool want_active;
 static volatile stream_state_t state;
 static uint16_t sof_trace_count;
 static volatile bool software_mute;
 static volatile uint8_t attenuation_steps;
+static uint32_t settle_tick;
+static uint8_t consecutive_recoveries;
+
+static bool dma_active(void)
+{ return state == STREAM_MEASURING || state == STREAM_SETTLING ||
+         state == STREAM_RUNNING; }
 
 void stream_set_controls(bool mute, int16_t volume_db256)
 {
@@ -30,21 +41,9 @@ void stream_set_controls(bool mute, int16_t volume_db256)
     attenuation_steps = (uint8_t)((-volume_db256 + 384) / 768);
 }
 
-static int32_t decode_pcm24(const uint8_t *p)
-{
-    int32_t value = (int32_t)((uint32_t)p[0] |
-                    ((uint32_t)p[1] << 8U) |
-                    ((uint32_t)p[2] << 16U));
-    if (p[2] & 0x80U) value |= (int32_t)0xFF000000U;
-    if (software_mute) return 0;
-    const uint8_t steps = attenuation_steps;
-    if (steps & 1U) value = (value * 181) / 256; // ~3 dB
-    return value / (int32_t)(1U << (steps / 2U));
-}
-
 static void sample_dma_cursor(void)
 {
-    if (state != STREAM_RUNNING) return;
+    if (!dma_active()) return;
     const uint32_t remaining = audio_dma_remaining();
     if (remaining > DMA_RING_HALFWORDS) {
         state = STREAM_FAULT;
@@ -54,9 +53,7 @@ static void sample_dma_cursor(void)
     }
     uint32_t position = DMA_RING_HALFWORDS - remaining;
     if (position == DMA_RING_HALFWORDS) position = 0U;
-    const uint32_t moved =
-        (position + DMA_RING_HALFWORDS - last_dma_position) %
-        DMA_RING_HALFWORDS;
+    const uint32_t moved = ring_dma_delta(position, last_dma_position);
     last_dma_position = position;
     consumed += moved;
     queued = produced - consumed;
@@ -77,7 +74,7 @@ static void clear_stopped_buffer(uint32_t hz)
     last_dma_position = 0U;
     queued = 0U;
     selected_rate = hz;
-    feedback_q14 = hz << 14;
+    feedback_q14 = (uint32_t)(((uint64_t)hz * 16384U + 500U) / 1000U);
     state = STREAM_PREFILL;
 }
 
@@ -87,6 +84,10 @@ void stream_reset(uint32_t hz)
     __disable_irq();
     state = STREAM_STOPPED;
     __set_PRIMASK(primask);
+    audio_output_mute();
+    if (audio_amp_control_enabled())
+        diag_event(DIAG_AMP_MUTED, hz, 0U);
+    diag_event(DIAG_DAC_MUTED, hz, 0U);
     if (!audio_stop_dma()) {
         state = STREAM_FAULT;
         audio_request_fault();
@@ -101,14 +102,21 @@ void stream_reset(uint32_t hz)
     clear_stopped_buffer(hz);
     rate_begin(hz, audio_clock_n(), audio_clock_divisor());
     audio_clear_fault();
+    ++diag_counts.rate_changes;
     diag_event(DIAG_RATE_CHANGE, hz,
                ((uint32_t)audio_clock_n() << 16) | audio_clock_divisor());
 }
 
-void stream_request_rate(uint32_t hz) { pending_rate = hz; }
+void stream_request_rate(uint32_t hz)
+{
+    requested_rate = hz;
+    pending_rate = hz;
+    diag_event(DIAG_RATE_REQUEST, hz, selected_rate);
+}
 void stream_set_active(bool active)
 {
-    if (active && !want_active) pending_rate = selected_rate;
+    if (active && !want_active && pending_rate == 0U)
+        pending_rate = selected_rate;
     want_active = active;
 }
 
@@ -119,16 +127,17 @@ bool stream_receive(const uint8_t *packet, uint16_t bytes)
         diag_event(DIAG_BAD_PACKET, bytes, diag_counts.malformed);
         return false;
     }
-    if (!want_active || (state != STREAM_PREFILL &&
-                         state != STREAM_RUNNING)) return false;
+    if (!want_active || pending_rate != 0U ||
+        (state != STREAM_PREFILL && !dma_active()))
+        return false;
     sample_dma_cursor();
     if (state == STREAM_FAULT) return false;
 
     const uint32_t frames = bytes / USB_BYTES_PER_FRAME;
     const uint32_t words = frames * DMA_HALFWORDS_PER_FRAME;
-    const uint32_t reserve = state == STREAM_RUNNING ?
+    const uint32_t reserve = dma_active() ?
                              DMA_SAFE_HALFWORDS : 0U;
-    if (queued + words + reserve >= DMA_RING_HALFWORDS) {
+    if (!ring_can_write(queued, words, reserve)) {
         ++diag_counts.overruns;
         ++diag_counts.dropped;
         diag_event(DIAG_OVERRUN, queued, words);
@@ -139,11 +148,11 @@ bool stream_receive(const uint8_t *packet, uint16_t bytes)
     uint32_t cursor = produced % DMA_RING_HALFWORDS;
     for (uint32_t i = 0; i < frames; ++i) {
         const uint8_t *frame = packet + i * USB_BYTES_PER_FRAME;
-        for (uint32_t ch = 0; ch < 2U; ++ch) {
-            const uint8_t *pcm = frame + ch * 3U;
-            const uint32_t word = (uint32_t)decode_pcm24(pcm);
-            samples[cursor++] = (uint16_t)(word >> 8U);
-            samples[cursor++] = (uint16_t)(word << 8U);
+        uint16_t converted[DMA_HALFWORDS_PER_FRAME];
+        pcm24_stereo_to_i2s(frame, converted, software_mute,
+                            attenuation_steps);
+        for (uint32_t word = 0; word < DMA_HALFWORDS_PER_FRAME; ++word) {
+            samples[cursor++] = converted[word];
             if (cursor == DMA_RING_HALFWORDS) cursor = 0U;
         }
     }
@@ -156,8 +165,13 @@ bool stream_receive(const uint8_t *packet, uint16_t bytes)
 void stream_sof(void)
 {
     sample_dma_cursor();
-    if (state == STREAM_RUNNING) {
-        rate_sof(consumed);
+    if (dma_active()) {
+        if (queued < diag_counts.queue_min)
+            diag_counts.queue_min = queued;
+        if (queued > diag_counts.queue_max)
+            diag_counts.queue_max = queued;
+        if (state == STREAM_MEASURING)
+            rate_sof(consumed);
         if (++sof_trace_count == 250U) {
             sof_trace_count = 0U;
             diag_event(DIAG_DMA, consumed, produced);
@@ -165,6 +179,10 @@ void stream_sof(void)
         }
     }
     feedback_q14 = rate_feedback_q14(selected_rate, queued);
+    if (feedback_q14 < diag_counts.feedback_min_q14)
+        diag_counts.feedback_min_q14 = feedback_q14;
+    if (feedback_q14 > diag_counts.feedback_max_q14)
+        diag_counts.feedback_max_q14 = feedback_q14;
 }
 
 void stream_service(void)
@@ -179,13 +197,27 @@ void stream_service(void)
     if (next != 0U) stream_reset(next);
 
     if (!want_active) {
-        if (state == STREAM_RUNNING) {
+        if (state != STREAM_STOPPED) {
+            const bool was_dma_active = dma_active();
             state = STREAM_STOPPED;
-            if (!audio_stop_dma()) audio_request_fault();
+            if (was_dma_active && !audio_stop_dma()) audio_request_fault();
+            memset(samples, 0, sizeof(samples));
+            produced = consumed = queued = 0U;
         }
+        if (!audio_dac_is_muted() || !audio_amp_is_muted())
+            audio_output_mute();
         return;
     }
     if (audio_fault_pending() || state == STREAM_FAULT) {
+        audio_output_mute();
+        if (++consecutive_recoveries > 3U) {
+            state = STREAM_CLOCK_FAILED;
+            ++diag_counts.calibration_failures;
+            diag_event(DIAG_RATE_FAILED, selected_rate,
+                       consecutive_recoveries);
+            (void)audio_stop_dma();
+            return;
+        }
         if (!audio_stop_dma()) return;
         ++diag_counts.recoveries;
         diag_event(DIAG_RESTART, diag_counts.recoveries, queued);
@@ -197,16 +229,45 @@ void stream_service(void)
     }
 
     rate_override_t correction;
-    if (state == STREAM_RUNNING && rate_phase() == RATE_ADJUST_PENDING) {
+    if (state == STREAM_MEASURING && rate_phase() == RATE_ADJUST_PENDING) {
         const uint32_t measured = rate_measured_hz();
         diag_event(DIAG_CLOCK_MEASURE, measured, selected_rate);
         if (rate_take_adjustment(&correction)) {
+            ++diag_counts.calibrations;
             diag_event(DIAG_CLOCK_TUNE, measured,
                        ((uint32_t)correction.pll_n << 16) |
                        correction.divisor);
             stream_reset(selected_rate); // one main-loop tuning transition
             return;
         }
+    }
+    if (state == STREAM_MEASURING && rate_phase() == RATE_FAILED) {
+        audio_output_mute();
+        state = STREAM_CLOCK_FAILED;
+        (void)audio_stop_dma();
+        ++diag_counts.calibration_failures;
+        diag_event(DIAG_RATE_FAILED, rate_measured_hz(),
+                   (uint32_t)rate_error_ppm());
+        return;
+    }
+    if (state == STREAM_MEASURING && rate_phase() == RATE_DONE) {
+        diag_event(DIAG_RATE_VERIFY, rate_measured_hz(),
+                   (uint32_t)rate_error_ppm());
+        audio_dac_unmute();
+        diag_event(DIAG_DAC_UNMUTED, selected_rate, 0U);
+        settle_tick = HAL_GetTick();
+        state = STREAM_SETTLING;
+    }
+    if (state == STREAM_SETTLING &&
+        (uint32_t)(HAL_GetTick() - settle_tick) >= ANALOG_SETTLE_MS) {
+        if (audio_amp_control_enabled()) {
+            audio_amp_unmute();
+            diag_event(DIAG_AMP_UNMUTED, selected_rate, 0U);
+        }
+        state = STREAM_RUNNING;
+        consecutive_recoveries = 0U;
+        diag_event(DIAG_RATE_COMPLETE, selected_rate,
+                   rate_measured_hz());
     }
     if (state == STREAM_PREFILL && queued >= DMA_PREFILL_HALFWORDS) {
         if (!audio_start_dma(samples, DMA_RING_HALFWORDS)) {
@@ -221,8 +282,8 @@ void stream_service(void)
         // frames. Keep all cursor accounting in DMA halfwords.
         last_dma_position = 0U;
         consumed = 0U;
-        state = STREAM_RUNNING;
-        audio_set_mute(false);
+        state = STREAM_MEASURING;
+        diag_event(DIAG_DMA_STARTED, selected_rate, queued);
     }
 }
 
@@ -232,3 +293,13 @@ uint32_t stream_rate(void) { return selected_rate; }
 uint32_t stream_feedback_q14(void) { return feedback_q14; }
 uint32_t stream_queued_halfwords(void) { return queued; }
 uint32_t stream_consumed_halfwords(void) { return consumed; }
+uint32_t stream_produced_halfwords(void) { return produced; }
+uint32_t stream_state_code(void) { return (uint32_t)state; }
+uint32_t stream_requested_rate(void) { return requested_rate; }
+void stream_quiesce(void)
+{
+    want_active = false;
+    state = STREAM_STOPPED;
+    audio_output_mute();
+    (void)audio_stop_dma();
+}

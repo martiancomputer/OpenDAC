@@ -6,7 +6,7 @@
 #include <string.h>
 
 enum {
-    CONFIG_LEN = 139,
+    CONFIG_LEN = 142,
     FEATURE_UNIT = 2,
     CMD_SET_CUR = 0x01,
     CMD_GET_CUR = 0x81,
@@ -16,7 +16,7 @@ enum {
 };
 
 // UAC1 AudioControl + AudioStreaming alt 0/1 + asynchronous OUT feedback
-// endpoint + DFU runtime. 24-bit packed USB data at 48 or 96 kHz.
+// endpoint + DFU runtime. 24-bit packed USB data at 44.1/48/96 kHz.
 static uint8_t config_descriptor[] = {
     9, 2, CONFIG_LEN, 0, 3, 1, 0, 0x80, 50,
     9, 4, 0, 0, 0, 1, 1, 0, 0,
@@ -27,7 +27,8 @@ static uint8_t config_descriptor[] = {
     9, 4, AUDIO_INTERFACE, 0, 0, 1, 2, 0, 0,
     9, 4, AUDIO_INTERFACE, 1, 2, 1, 2, 0, 0,
     7, 0x24, 1, 1, 1, 1, 0,
-    14, 0x24, 2, 1, 2, 3, 24, 2,
+    17, 0x24, 2, 1, 2, 3, 24, 3,
+        0x44, 0xAC, 0x00, // 44100, requires physical validation
         0x80, 0xBB, 0x00, // 48000
         0x00, 0x77, 0x01, // 96000
     9, 5, USB_AUDIO_OUT, 0x05,
@@ -74,9 +75,9 @@ static uint8_t class_init(USBD_HandleTypeDef *pdev, uint8_t configuration)
                        3U) != USBD_OK) return USBD_FAIL;
     pdev->ep_out[USB_AUDIO_OUT].is_used = 1U;
     pdev->ep_in[USB_FEEDBACK_IN & 0xFU].is_used = 1U;
-    return USBD_LL_PrepareReceive(pdev, USB_AUDIO_OUT,
-                                  (uint8_t *)audio_usb.rx_words,
-                                  USB_PACKET_BYTES);
+    // OUT is armed only when the host selects streaming alt 1. Arming at
+    // configuration time caused an ISO incomplete interrupt every idle SOF.
+    return USBD_OK;
 }
 
 static uint8_t class_deinit(USBD_HandleTypeDef *pdev, uint8_t configuration)
@@ -110,7 +111,9 @@ static uint8_t class_setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
         uint8_t *payload = req->bRequest == 0x5AU ?
                            diag_status(&len) :
                            req->bRequest == 0x5BU ?
-                           diag_page(req->wIndex, &len) : NULL;
+                           diag_page(req->wIndex, &len) :
+                           req->bRequest == 0x5CU ?
+                           diag_extended(req->wIndex, &len) : NULL;
         if (payload != NULL) {
             if (len > req->wLength) len = req->wLength;
             return USBD_CtlSendData(pdev, payload, len);
@@ -212,7 +215,8 @@ static uint8_t class_control_ready(USBD_HandleTypeDef *pdev)
         uint32_t hz = audio_usb.control_buffer[0] |
                       ((uint32_t)audio_usb.control_buffer[1] << 8U) |
                       ((uint32_t)audio_usb.control_buffer[2] << 16U);
-        if (hz == 48000U || hz == 96000U) stream_request_rate(hz);
+        if (hz == 44100U || hz == 48000U || hz == 96000U)
+            stream_request_rate(hz);
         else return USBD_FAIL;
     } else if (command == CTRL_MUTE) {
         audio_usb.muted = audio_usb.control_buffer[0] != 0U;
@@ -272,6 +276,7 @@ static uint8_t class_incomplete_in(USBD_HandleTypeDef *pdev, uint8_t ep)
 static uint8_t class_incomplete_out(USBD_HandleTypeDef *pdev, uint8_t ep)
 {
     if (ep != USB_AUDIO_OUT) return USBD_FAIL;
+    if (audio_usb.alt != 1U) return USBD_OK;
     ++diag_counts.usb_incomplete;
     return rearm_out(pdev); // never arm into the DMA ring
 }

@@ -11,6 +11,12 @@ uint32_t audio_dma_remaining(void);
 uint16_t audio_clock_n(void);
 uint16_t audio_clock_divisor(void);
 void audio_set_mute(bool mute);
+void audio_output_mute(void);
+void audio_dac_unmute(void);
+void audio_amp_unmute(void);
+bool audio_dac_is_muted(void);
+bool audio_amp_is_muted(void);
+bool audio_amp_control_enabled(void);
 void audio_request_fault(void);
 bool audio_fault_pending(void);
 void audio_clear_fault(void);
@@ -28,5 +34,9 @@ uint32_t stream_rate(void);
 uint32_t stream_feedback_q14(void);
 uint32_t stream_queued_halfwords(void);
 uint32_t stream_consumed_halfwords(void);
+uint32_t stream_produced_halfwords(void);
+uint32_t stream_state_code(void);
+uint32_t stream_requested_rate(void);
+void stream_quiesce(void);
 
 #endif

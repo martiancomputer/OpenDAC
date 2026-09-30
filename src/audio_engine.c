@@ -2,30 +2,82 @@
 #include "rate_control.h"
 #include "diag.h"
 #include "stm32f4xx_hal.h"
+#include "hardware.h"
 
 static I2S_HandleTypeDef i2s;
 static DMA_HandleTypeDef dma_tx;
 static volatile bool dma_fault;
 static uint16_t active_n;
 static uint16_t active_divisor;
+static volatile bool dac_muted = true;
+static volatile bool amp_muted = true;
+
+typedef struct {
+    uint32_t hz;
+    uint16_t pll_n;
+    uint8_t pll_r;
+    uint16_t divisor; // 2 * I2SDIV + ODD
+} audio_rate_profile_t;
+
+static const audio_rate_profile_t rate_profiles[] = {
+    {44100U, 271U, 2U, 48U}, // theoretical nominal; not hardware-validated
+    {48000U, 384U, 5U, 25U}, // established prototype starting point
+    {96000U, 424U, 3U, 23U}
+};
+
+static const audio_rate_profile_t *find_rate_profile(uint32_t hz)
+{
+    for (uint32_t i = 0; i < sizeof(rate_profiles) / sizeof(rate_profiles[0]);
+         ++i)
+        if (rate_profiles[i].hz == hz) return &rate_profiles[i];
+    return NULL;
+}
 
 void audio_set_mute(bool mute)
 {
-    // The validated prototype uses PB8 -> PCM5102A XSMT (active low).
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, mute ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    HAL_GPIO_WritePin(PCM_XSMT_PORT, PCM_XSMT_PIN,
+                      mute ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    dac_muted = mute;
 }
+
+void audio_output_mute(void)
+{
+    // Headphone stage off first; never amplify a DAC transition.
+#if CONFIG_TPA6138A2
+    HAL_GPIO_WritePin(TPA_MUTE_PORT, TPA_MUTE_PIN, GPIO_PIN_RESET);
+#endif
+    amp_muted = true;
+    audio_set_mute(true);
+}
+
+void audio_dac_unmute(void) { audio_set_mute(false); }
+void audio_amp_unmute(void)
+{
+#if CONFIG_TPA6138A2
+    HAL_GPIO_WritePin(TPA_MUTE_PORT, TPA_MUTE_PIN, GPIO_PIN_SET);
+    amp_muted = false;
+#endif
+}
+bool audio_dac_is_muted(void) { return dac_muted; }
+bool audio_amp_is_muted(void) { return amp_muted; }
+bool audio_amp_control_enabled(void) { return CONFIG_TPA6138A2 != 0; }
 
 bool audio_hw_init(void)
 {
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_SPI2_CLK_ENABLE();
     __HAL_RCC_DMA1_CLK_ENABLE();
-    audio_set_mute(true);
+    audio_output_mute();
     GPIO_InitTypeDef pins = {0};
-    pins.Pin = GPIO_PIN_8;
+    pins.Pin = PCM_XSMT_PIN;
     pins.Mode = GPIO_MODE_OUTPUT_PP;
     pins.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &pins);
+#if CONFIG_TPA6138A2
+    HAL_GPIO_WritePin(TPA_MUTE_PORT, TPA_MUTE_PIN, GPIO_PIN_RESET);
+    pins.Pin = TPA_MUTE_PIN;
+    HAL_GPIO_Init(TPA_MUTE_PORT, &pins);
+#endif
 
     pins.Pin = GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_15;
     pins.Mode = GPIO_MODE_AF_PP;
@@ -54,18 +106,13 @@ bool audio_hw_init(void)
 
 bool audio_select_rate(uint32_t hz)
 {
-    const uint16_t preset_n = hz == 48000U ? 384U :
-                              hz == 96000U ? 424U : 0U;
-    const uint16_t preset_r = hz == 48000U ? 5U :
-                              hz == 96000U ? 3U : 0U;
-    const uint16_t preset_div = hz == 48000U ? 25U :
-                                hz == 96000U ? 23U : 0U;
-    if (preset_n == 0U) return false;
+    const audio_rate_profile_t *profile = find_rate_profile(hz);
+    if (profile == NULL) return false;
 
-    audio_set_mute(true);
+    audio_output_mute();
     rate_override_t saved = rate_override_for(hz);
-    const uint16_t n = saved.valid ? saved.pll_n : preset_n;
-    const uint16_t divisor = saved.valid ? saved.divisor : preset_div;
+    const uint16_t n = saved.valid ? saved.pll_n : profile->pll_n;
+    const uint16_t divisor = saved.valid ? saved.divisor : profile->divisor;
     if (i2s.State != HAL_I2S_STATE_RESET &&
         HAL_I2S_DeInit(&i2s) != HAL_OK) return false;
 #ifdef RCC_CFGR_I2SSRC
@@ -74,7 +121,7 @@ bool audio_select_rate(uint32_t hz)
     RCC_PeriphCLKInitTypeDef pll = {0};
     pll.PeriphClockSelection = RCC_PERIPHCLK_I2S;
     pll.PLLI2S.PLLI2SN = n;
-    pll.PLLI2S.PLLI2SR = preset_r;
+    pll.PLLI2S.PLLI2SR = profile->pll_r;
     if (HAL_RCCEx_PeriphCLKConfig(&pll) != HAL_OK ||
         __HAL_RCC_GET_FLAG(RCC_FLAG_PLLI2SRDY) == RESET) return false;
 
@@ -107,7 +154,7 @@ bool audio_start_dma(uint16_t *data, uint16_t halfwords)
 
 bool audio_stop_dma(void)
 {
-    audio_set_mute(true);
+    audio_output_mute();
     if (i2s.State == HAL_I2S_STATE_RESET ||
         i2s.State == HAL_I2S_STATE_READY) return true;
     return HAL_I2S_DMAStop(&i2s) == HAL_OK;

@@ -12,9 +12,10 @@
   ST files.
 - Run `make -j4` and `make test` after changes. Hardware/audio claims require
   physical testing; a successful compile is not enumeration proof.
-- Do not advertise new sample rates until physical DMA-clock measurements and
-  USB host tests support them. Do not convert producer pressure into an I²S
-  restart loop.
+- Do not call a newly advertised rate hardware-validated until physical
+  DMA-clock measurements and USB host tests support it. Keep the distinction
+  explicit in README. Do not convert producer pressure into an I²S restart
+  loop.
 - Keep documentation, logs, examples, commit messages, and staged changes free
   of usernames, home paths, hostnames, serial numbers, MACs, private IPs,
   personal email, credentials, tokens, and other identifying information.
